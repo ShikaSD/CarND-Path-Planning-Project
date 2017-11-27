@@ -1,14 +1,13 @@
 #include <fstream>
 #include <math.h>
 #include <uWS/uWS.h>
-#include <ctime>
 #include <iostream>
 #include <thread>
 #include <vector>
-#include "Eigen-3.3/Eigen/Core"
-#include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
 #include "spline.h"
+#include "Trajectory.h"
+#include "helpers.h"
 
 using namespace std;
 
@@ -155,15 +154,14 @@ vector<double> getXY(
   }
 
   auto wp2 = (wp+1)%maps_x.size();
-
-  vector<double> x_coords, y_coords;
-  for (int i = 0; i < 5; i++) {
-    auto index = (prev_wp + i) % maps_x.size();
-    x_coords.push_back(maps_x[index] + d * maps_dx[index]);
-    y_coords.push_back(maps_y[index] + d * maps_dy[index]);
+  vector<double> x_coords(10), y_coords(10);
+  for (int i = 0; i < 10; i++) {
+      auto index = (prev_wp + i) % maps_x.size();
+      x_coords[i] = maps_x[index] + d * maps_dx[index];
+      y_coords[i] = maps_y[index] + d * maps_dy[index];
   }
-  tk::spline spline;
-  spline.set_points(x_coords, y_coords);
+
+  auto coeffs = polyfit(Eigen::VectorXd(x_coords.data()), Eigen::VectorXd(y_coords.data()), 3);
 
 //  double heading = atan2((maps_y[wp2]-maps_y[prev_wp]),(maps_x[wp2]-maps_x[prev_wp]));
   // the x,y,s along the segment
@@ -176,7 +174,7 @@ vector<double> getXY(
   double delta_x = (maps_x[wp2] - maps_x[wp]) * delta_s;
 
   double x = maps_x[wp] + d * maps_dx[wp] + delta_x;
-  double y = spline(x);
+  double y = polyeval(coeffs, x);
 
 
 //	double heading = atan2((maps_y[wp2]-maps_y[wp]),(maps_x[wp2]-maps_x[wp]));
@@ -277,21 +275,37 @@ int main() {
           vector<double> next_x_vals;
           vector<double> next_y_vals;
 
+//          int next;
+//          for (next = 0; next < previous_path_x.size(); next++) {
+//              double x = previous_path_x[next];
+//              double y = previous_path_y[next];
+//              if (car_yaw - fabs(atan2(x - (car_x + 0.2 * car_vx), y - (car_y + 0.2 * car_vy))) < pi() / 4) {
+//                  break;
+//              }
+//          }
+//
+//          next_x_vals.insert(next_x_vals.end(), previous_path_x.begin() + next, previous_path_x.end());
+//          next_y_vals.insert(next_y_vals.end(), previous_path_y.begin() + next, previous_path_y.end());
+
+
           // int next = NextWaypoint(car_x, car_y, car_yaw, map_waypoints_x, map_waypoints_y);
           // cout << "Next waypoint: " << next << endl;
-          for (int i = 1; i <= 100; ++i) {
-            auto xy = getXY(
-                car_s + i * 0.1,
-                6,
-                map_waypoints_s,
-                map_waypoints_x,
-                map_waypoints_y,
-                map_waypoints_dx,
-                map_waypoints_dy);
+          for (int i = 1; i <= 100/* - previous_path_x.size() + next*/; ++i) {
+              double s = (previous_path_x.size() == 0) ? car_s : end_path_s;
 
-            next_x_vals.push_back(xy[0]);
-            next_y_vals.push_back(xy[1]);
+              auto xy = getXY(
+                      car_s + i * 0.5,
+                      6,
+                      map_waypoints_s,
+                      map_waypoints_x,
+                      map_waypoints_y,
+                      map_waypoints_dx,
+                      map_waypoints_dy);
+
+              next_x_vals.push_back(xy[0]);
+              next_y_vals.push_back(xy[1]);
           }
+
 
           cout <<"s = " <<car_s <<endl;
 

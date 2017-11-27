@@ -5,13 +5,15 @@
 #ifndef PATH_PLANNING_TRAJECTORY_H
 #define PATH_PLANNING_TRAJECTORY_H
 
-#include "Eigen-3.3/Eigen/Core"
-#include "Eigen-3.3/Eigen/QR"
-
+using namespace std;
 
 class Trajectory {
+
   public:
-    //Trajectory(VectorXd s, VectorXd d, double target_s, double target_d, )
+    Trajectory(vector<double> &x, vector<double> &y, vector<double> &target, double &t, vector<vector<double>> &predictions);
+
+    vector<double> trajectory_x;
+    vector<double> trajectory_y;
 };
 
 
