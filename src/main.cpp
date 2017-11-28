@@ -8,7 +8,7 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
-#include "spline.h"
+#include "MPC.h"
 
 using namespace std;
 
@@ -35,22 +35,37 @@ string hasData(string s) {
   return "";
 }
 
-tk::spline fitSpline(std::vector<double> &x_coords, std::vector<double> &y_coords) {
-  std::vector<std::vector<double>> coords(x_coords.size());
-  for (int i = 0; i < x_coords.size(); i++) {
-    coords[i] = {x_coords[i], y_coords[i]};
-  }
-  sort(coords.begin(), coords.end(), [&](std::vector<double> a, std::vector<double> b) { return a[0] < b[0]; });
-  for (int i = 0; i < coords.size(); i++) {
-    cout <<"x: " <<coords[i][0] <<" y: " <<coords[i][1] <<" | ";
-    x_coords[i] = (coords[i][0]);
-    y_coords[i] = (coords[i][1]);
-  }
-  cout <<endl;
+// Fit a polynomial.
+// Adapted from
+// https://github.com/JuliaMath/Polynomials.jl/blob/master/src/Polynomials.jl#L676-L716
+Eigen::VectorXd polyfit(Eigen::VectorXd xvals, Eigen::VectorXd yvals,
+                        int order) {
+  assert(xvals.size() == yvals.size());
+  assert(order >= 1 && order <= xvals.size() - 1);
+  Eigen::MatrixXd A(xvals.size(), order + 1);
 
-  tk::spline spline;
-  spline.set_points(x_coords, y_coords);
-  return spline;
+  for (int i = 0; i < xvals.size(); i++) {
+    A(i, 0) = 1.0;
+  }
+
+  for (int j = 0; j < xvals.size(); j++) {
+    for (int i = 0; i < order; i++) {
+      A(j, i + 1) = A(j, i) * xvals(j);
+    }
+  }
+
+  auto Q = A.householderQr();
+  auto result = Q.solve(yvals);
+  return result;
+}
+
+// Evaluate a polynomial.
+double polyeval(Eigen::VectorXd coeffs, double x) {
+  double result = 0.0;
+  for (int i = 0; i < coeffs.size(); i++) {
+    result += coeffs[i] * pow(x, i);
+  }
+  return result;
 }
 
 double distance(double x1, double y1, double x2, double y2)
@@ -177,6 +192,37 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+int car_ahead(nlohmann::json &sensor_fusion, double lane, double car_x, double car_y, double car_yaw, double look_ahead, bool look_back) {
+  double current_dist = 1e+10;
+  int car_index = -1;
+
+  for (int i = 0; i < sensor_fusion.size(); i++) {
+    auto car = sensor_fusion[i];
+    double x = car[1];
+    double y = car[2];
+    double vx = car[3];
+    double vy = car[4];
+    double s = car[5];
+    double d = car[6];
+
+    double limit = look_back ? pi() * .75 : pi() * .5;
+
+    if (d > 4 * lane && d < 4 * (lane + 1)) {
+      // We are on the same lane
+      double dist = distance(x, y, car_x, car_y);
+      current_dist = min(dist, current_dist);
+      double angle = atan2(y - car_y, x - car_x) - car_yaw;
+      if ((dist < look_ahead) && (fabs(atan2(sin(angle), cos(angle))) < limit)) {
+        if (fabs(current_dist - dist) < 0.1) {
+          car_index = i;
+        }
+      }
+    }
+  }
+
+  return car_index;
+}
+
 int main() {
   uWS::Hub h;
 
@@ -214,13 +260,14 @@ int main() {
     map_waypoints_dy.push_back(d_y);
   }
 
-  int lane = 1;
+  int target_lane = 1;
   double speed_limit = 49.9;
   double inc_update = (speed_limit / 2.24) * 0.02 / 2;
   double ref_speed = 0;
   double min_speed = inc_update;
+  MPC mpc;
 
-  h.onMessage([&map_waypoints_x, &map_waypoints_y, &map_waypoints_s, &map_waypoints_dx, &map_waypoints_dy, &lane, &speed_limit, &inc_update, &ref_speed, &min_speed](
+  h.onMessage([&map_waypoints_x, &map_waypoints_y, &map_waypoints_s, &map_waypoints_dx, &map_waypoints_dy, &target_lane, &speed_limit, &inc_update, &ref_speed, &min_speed, &mpc](
       uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
       uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
@@ -260,101 +307,134 @@ int main() {
           // Sensor Fusion Data, a list of all other cars on the same side of the road.
           auto sensor_fusion = j[1]["sensor_fusion"];
 
-          double look_ahead = 30;
+          double buf_size = previous_path_x.size() / 2;
 
-          bool car_ahead = false;
-          double current_dist = 1e+10;
-          for (auto car : sensor_fusion) {
-            double x = car[1];
-            double y = car[2];
-            double vx = car[3];
-            double vy = car[4];
-            double s = car[5];
-            double d = car[6];
-
-            if (d > 4 * lane && d < 4 * (lane + 1)) {
-              // We are on the same lane
-              double dist = distance(x, y, car_x, car_y);
-              current_dist = min(dist, current_dist);
-              double angle = atan2(y - car_y, x - car_x) - car_yaw;
-              cout <<dist <<" " <<fabs(angle) <<" " <<fabs(atan2(sin(angle), cos(angle))) <<endl;
-              if (dist < look_ahead && fabs(atan2(sin(angle), cos(angle)) < pi() / 4)) {
-                car_ahead = true;
-                if (fabs(current_dist - dist) < 0.1) {
-                  min_speed = max(inc_update, sqrt(vx * vx + vy * vy) * 2.24 - (look_ahead - dist));
-                }
-              }
-            }
-          }
-
-          double d_mod = 0;
-
-          cout <<"car ahead: " <<car_ahead <<" min speed: " <<min_speed <<endl;
-          if (car_ahead) {
-            ref_speed -= inc_update;
-          } else if (ref_speed < speed_limit) {
-            ref_speed += inc_update;
-          }
-
-          ref_speed = max(min_speed, min(ref_speed, speed_limit));
-
-          double m_per_update = 0.02 * ref_speed / 2.24; // freq * speed_limit / mph to mps
+          int current_lane = ((int) car_d) / 4 ;
 
           int empty_limit = 2;
           vector<vector<double>> wpts;
           double ref_x = car_x, ref_y = car_y, ref_yaw = car_yaw;
 
-          if (previous_path_x.size() < empty_limit) {
+          if (buf_size < empty_limit) {
             double prev_x = ref_x - cos(car_yaw);
             double prev_y = ref_y - sin(car_yaw);
             wpts.push_back({ prev_x, prev_y });
             wpts.push_back({ ref_x, ref_y });
           } else {
-            ref_x = previous_path_x.back();
-            ref_y = previous_path_y.back();
+            ref_x = previous_path_x[buf_size - 1];
+            ref_y = previous_path_y[buf_size - 1];
 
-            double prev_x = *(previous_path_x.end() - 2);
-            double prev_y = *(previous_path_y.end() - 2);
+            double prev_x = (previous_path_x[buf_size - 2]);
+            double prev_y = (previous_path_y[buf_size - 2]);
 
             ref_yaw = atan2(ref_y - prev_y, ref_x - prev_x);
             wpts.push_back({ prev_x, prev_y });
             wpts.push_back({ ref_x, ref_y });
           }
 
-          for (int i = 0; i < 2; ++i) {
-            wpts.push_back(getXY(car_s + (i + 1) * 30, (2 + 4 * lane) + d_mod, map_waypoints_s, map_waypoints_x, map_waypoints_y));
+          double look_ahead = 60;
+
+          int car_ahead_index = car_ahead(sensor_fusion, current_lane, car_x, car_y, car_yaw, look_ahead / 2, false);
+          bool is_car_ahead = car_ahead_index > -1;
+
+          if (is_car_ahead) {
+            ref_speed -= inc_update;
+
+            auto car_ahead_ = sensor_fusion[car_ahead_index];
+            double car_ahead_vx = car_ahead_[3];
+            double car_ahead_vy = car_ahead_[4];
+            double car_ahead_speed = sqrt(car_ahead_vx * car_ahead_vx + car_ahead_vy * car_ahead_vy);
+            double car_dist = distance(car_x, car_y, car_ahead_[1], car_ahead_[2]);
+            // Speed update
+            min_speed = max(inc_update, car_ahead_speed * 2.24 - (look_ahead / 2 - car_dist));
+
+            // Choose lane if not switching
+            if (target_lane == current_lane) {
+              // TODO: Implement for current lane a well
+              vector<vector<double>> lanes = { { (double) current_lane + 1, -1 }, { (double) current_lane - 1, -1 } };
+
+              int next_lane = current_lane;
+              for (auto &pair: lanes) {
+                int lane = (int) pair[0];
+                if (lane < 0 || lane > 2) {
+                  pair[1] = 1e10;
+                  continue;
+                }
+
+                // TODO: Use both
+                auto lane_car_index = car_ahead(sensor_fusion, lane, car_x, car_y, car_yaw, look_ahead, false);
+                auto lane_back_index = car_ahead(sensor_fusion, lane, car_x, car_y, car_yaw, look_ahead, true);
+
+//                if (lane_car_index != lane_back_index) lane_car_index = lane_back_index;
+
+                if (lane_car_index != -1) {
+                  auto lane_ahead_ = sensor_fusion[lane_car_index];
+                  double lane_ahead_vx = lane_ahead_[3];
+                  double lane_ahead_vy = lane_ahead_[4];
+                  double lane_ahead_speed = sqrt(lane_ahead_vx * lane_ahead_vx + lane_ahead_vy * lane_ahead_vy);
+                  double lane_ahead_dist = distance(car_x, car_y, lane_ahead_[1], lane_ahead_[2]);
+
+                  if (lane_ahead_dist > car_dist && car_ahead_speed < lane_ahead_speed) {
+                    target_lane = lane;
+                    pair[1] = 1000 / (lane_ahead_dist + lane_ahead_speed);
+                  } else {
+                    pair[1] = 1e10;
+                  }
+                }
+              }
+              sort(lanes.begin(), lanes.end(), [&](vector<double> &a, vector<double> &b) { return a[1] < b[1]; });
+              if (lanes[0][1] < 1e10) {
+                target_lane = (int) lanes[0][0];
+              }
+            }
+
+          } else if (ref_speed < speed_limit) {
+            ref_speed += inc_update;
           }
 
-          vector<double> x_coords;
-          vector<double> y_coords;
+          bool lane_change = target_lane != current_lane;
+
+          cout <<"car index: " <<car_ahead_index <<" min_speed: " << min_speed <<endl;
+
+          ref_speed = max(min_speed, min(ref_speed, speed_limit));
+
+          double m_per_update = 0.02 * ref_speed / 2.24; // freq * speed_limit / mph to mps
+
+          double dist = lane_change ? 40 : 30;
+          for (int i = 0; i < 2; ++i) {
+            wpts.push_back(getXY(car_s + (i + 1) * dist, (2 + 4 * target_lane), map_waypoints_s, map_waypoints_x, map_waypoints_y));
+          }
+
+          Eigen::VectorXd x_coords(wpts.size());
+          Eigen::VectorXd y_coords(wpts.size());
           // Transform to car coords
-          for (auto &wpt : wpts) {
+          for (int i = 0; i < wpts.size(); ++i) {
+            auto wpt = wpts[i];
             double shift_x = wpt[0] - ref_x;
             double shift_y = wpt[1] - ref_y;
-            x_coords.push_back(shift_x * cos(-ref_yaw) - shift_y * sin(-ref_yaw));
-            y_coords.push_back(shift_y * cos(-ref_yaw) + shift_x * sin(-ref_yaw));
+            x_coords[i] = (shift_x * cos(-ref_yaw) - shift_y * sin(-ref_yaw));
+            y_coords[i] = (shift_y * cos(-ref_yaw) + shift_x * sin(-ref_yaw));
           }
 
-          tk::spline spline;
-          spline.set_points(x_coords, y_coords);
+          auto coeffs = polyfit(x_coords, y_coords, 3);
 
           vector<double> next_x_vals;
           vector<double> next_y_vals;
 
-          for (int i = 0; i < previous_path_x.size(); ++i) {
+          for (int i = 0; i < buf_size; ++i) {
             next_x_vals.push_back(previous_path_x[i]);
             next_y_vals.push_back(previous_path_y[i]);
           }
 
           double target_x = look_ahead;
-          double target_y = spline(target_x);
+          double target_y = polyeval(coeffs, target_x);
           double target_dist = distance(0, 0, target_x, target_y);
           double steps = target_dist / m_per_update;
           double step = target_x / steps;
 
-          for (int i = 1; i <= 50 - previous_path_x.size() - 1; ++i) {
+          for (int i = 1; i <= 50 - buf_size - 1; ++i) {
             double x = step * i;
-            double y = spline(x);
+            double y = polyeval(coeffs, x);
 
             double x_val = (x * cos(ref_yaw) - y * sin(ref_yaw)) + ref_x;
             double y_val = (y * cos(ref_yaw) + x * sin(ref_yaw)) + ref_y;
@@ -362,6 +442,22 @@ int main() {
             next_x_vals.push_back(x_val);
             next_y_vals.push_back(y_val);
           }
+
+//          Eigen::VectorXd x0(6);
+//          double cte = polyeval(coeffs[0], 0);
+//          x0 <<0, 0, 0, car_speed, polyeval(coeffs[0], 0), -atan(coeffs[1]);
+//          mpc.Solve(x0, coeffs, speed_limit / 2.24);
+//
+//          for (int i = 0; i < mpc.ptsx.size(); ++i) {
+//            double x = mpc.ptsx[i];
+//            double y = mpc.ptsy[i];
+//
+//            double x_val = (x * cos(ref_yaw) - y * sin(ref_yaw)) + ref_x;
+//            double y_val = (y * cos(ref_yaw) + x * sin(ref_yaw)) + ref_y;
+//
+//            next_x_vals.push_back(x_val);
+//            next_y_vals.push_back(y_val);
+//          }
 
           json msgJson;
 
