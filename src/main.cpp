@@ -8,7 +8,6 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
-#include "MPC.h"
 
 using namespace std;
 
@@ -192,27 +191,45 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+class Car {
+public:
+    double x, y, d, speed;
+
+    Car(nlohmann::json &sensor_fusion, int index) {
+      auto car = sensor_fusion[index];
+      x = car[1];
+      y = car[2];
+      double vx = car[3];
+      double vy = car[4];
+      speed = sqrt(vx * vx + vy * vy);
+      d = car[6];
+    }
+
+    double distanceTo(double to_x, double to_y) {
+      return distance(to_x, to_y, x, y);
+    }
+
+    double relativeAngleTo(double to_x, double to_y, double yaw) {
+      double angle = atan2(y - to_y, x - to_x) - yaw;
+      return atan2(sin(angle), cos(angle));
+    }
+};
+
 int car_ahead(nlohmann::json &sensor_fusion, double lane, double car_x, double car_y, double car_yaw, double look_ahead, bool look_back) {
   double current_dist = 1e+10;
   int car_index = -1;
 
   for (int i = 0; i < sensor_fusion.size(); i++) {
-    auto car = sensor_fusion[i];
-    double x = car[1];
-    double y = car[2];
-    double vx = car[3];
-    double vy = car[4];
-    double s = car[5];
-    double d = car[6];
+    auto car = Car(sensor_fusion, i);
 
-    double limit = look_back ? pi() * .75 : pi() * .5;
-
-    if (d > 4 * lane && d < 4 * (lane + 1)) {
+    if (car.d > 4 * lane && car.d < 4 * (lane + 1)) {
       // We are on the same lane
-      double dist = distance(x, y, car_x, car_y);
+      double dist = car.distanceTo(car_x, car_y);
       current_dist = min(dist, current_dist);
-      double angle = atan2(y - car_y, x - car_x) - car_yaw;
-      if ((dist < look_ahead) && (fabs(atan2(sin(angle), cos(angle))) < limit)) {
+      double norm_angle = fabs(car.relativeAngleTo(car_x, car_y, car_yaw));
+      bool is_in_direction = look_back ? norm_angle >= pi() * .5 : norm_angle < pi() * .5;
+
+      if (dist < look_ahead && is_in_direction) {
         if (fabs(current_dist - dist) < 0.1) {
           car_index = i;
         }
@@ -265,9 +282,8 @@ int main() {
   double inc_update = (speed_limit / 2.24) * 0.02 / 2;
   double ref_speed = 0;
   double min_speed = inc_update;
-  MPC mpc;
 
-  h.onMessage([&map_waypoints_x, &map_waypoints_y, &map_waypoints_s, &map_waypoints_dx, &map_waypoints_dy, &target_lane, &speed_limit, &inc_update, &ref_speed, &min_speed, &mpc](
+  h.onMessage([&map_waypoints_x, &map_waypoints_y, &map_waypoints_s, &map_waypoints_dx, &map_waypoints_dy, &target_lane, &speed_limit, &inc_update, &ref_speed, &min_speed](
       uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
       uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
@@ -340,13 +356,10 @@ int main() {
           if (is_car_ahead) {
             ref_speed -= inc_update;
 
-            auto car_ahead_ = sensor_fusion[car_ahead_index];
-            double car_ahead_vx = car_ahead_[3];
-            double car_ahead_vy = car_ahead_[4];
-            double car_ahead_speed = sqrt(car_ahead_vx * car_ahead_vx + car_ahead_vy * car_ahead_vy);
-            double car_dist = distance(car_x, car_y, car_ahead_[1], car_ahead_[2]);
+            auto car_ahead_ = Car(sensor_fusion, car_ahead_index);
+            double car_dist = car_ahead_.distanceTo(car_x, car_y);
             // Speed update
-            min_speed = max(inc_update, car_ahead_speed * 2.24 - (look_ahead / 2 - car_dist));
+            min_speed = max(inc_update, car_ahead_.speed * 2.24 - (look_ahead / 2 - car_dist));
 
             // Choose lane if not switching
             if (target_lane == current_lane) {
@@ -363,26 +376,38 @@ int main() {
 
                 // TODO: Use both
                 auto lane_car_index = car_ahead(sensor_fusion, lane, car_x, car_y, car_yaw, look_ahead, false);
-                auto lane_back_index = car_ahead(sensor_fusion, lane, car_x, car_y, car_yaw, look_ahead, true);
+                auto lane_back_index = car_ahead(sensor_fusion, lane, car_x, car_y, car_yaw, look_ahead / 2, true);
 
 //                if (lane_car_index != lane_back_index) lane_car_index = lane_back_index;
 
                 if (lane_car_index != -1) {
-                  auto lane_ahead_ = sensor_fusion[lane_car_index];
-                  double lane_ahead_vx = lane_ahead_[3];
-                  double lane_ahead_vy = lane_ahead_[4];
-                  double lane_ahead_speed = sqrt(lane_ahead_vx * lane_ahead_vx + lane_ahead_vy * lane_ahead_vy);
-                  double lane_ahead_dist = distance(car_x, car_y, lane_ahead_[1], lane_ahead_[2]);
+                  auto lane_ahead_ = Car(sensor_fusion, lane_car_index);
+                  auto lane_ahead_dist = lane_ahead_.distanceTo(car_x, car_y);
 
-                  if (lane_ahead_dist > car_dist && car_ahead_speed < lane_ahead_speed) {
-                    target_lane = lane;
-                    pair[1] = 1000 / (lane_ahead_dist + lane_ahead_speed);
+                  if (lane_ahead_dist > car_dist && lane_ahead_.speed > car_speed) {
+
+                    // Consider change
+                    pair[1] = 1000 / (lane_ahead_dist + lane_ahead_.speed);
+                    cout << "for lane: " << pair[0] << " car is ahead | ";
+
                   } else {
                     pair[1] = 1e10;
+                    cout << "for lane: " << pair[0] << " car ahead is too slow | ";
                   }
                 }
+
+                if (lane_back_index != -1) {
+                  // There is car to the back, do not change there
+                  auto lane_back_ = Car(sensor_fusion, lane_back_index);
+                  pair[1] = 1e10;
+                  cout << "for lane: " << pair[0] << " car is behind | ";
+                }
+
+                cout << "for lane: " << pair[0] << " weight is " << pair[1] << " | ";
               }
-              sort(lanes.begin(), lanes.end(), [&](vector<double> &a, vector<double> &b) { return a[1] < b[1]; });
+              cout <<endl;
+
+              sort(lanes.begin(), lanes.end(), [](vector<double> &a, vector<double> &b) -> bool { return a[1] < b[1]; });
               if (lanes[0][1] < 1e10) {
                 target_lane = (int) lanes[0][0];
               }
@@ -394,7 +419,8 @@ int main() {
 
           bool lane_change = target_lane != current_lane;
 
-          cout <<"car index: " <<car_ahead_index <<" min_speed: " << min_speed <<endl;
+          if (lane_change) cout <<"switch from " <<current_lane <<" to " <<target_lane <<endl;
+//          cout <<"car index: " <<car_ahead_index <<" min_speed: " << min_speed <<endl;
 
           ref_speed = max(min_speed, min(ref_speed, speed_limit));
 

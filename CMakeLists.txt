@@ -7,7 +7,7 @@ add_definitions(-std=c++11)
 set(CXX_FLAGS "-Wall")
 set(CMAKE_CXX_FLAGS, "${CXX_FLAGS}")
 
-set(sources src/main.cpp src/MPC.cpp src/MPC.h)
+set(sources src/main.cpp)
 
 if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin") 
 
@@ -22,4 +22,4 @@ endif(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 
 add_executable(path_planning ${sources})
 
-target_link_libraries(path_planning ipopt z ssl uv uWS)
+target_link_libraries(path_planning z ssl uv uWS)
