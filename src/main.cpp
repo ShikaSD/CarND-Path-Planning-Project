@@ -71,6 +71,7 @@ double distance(double x1, double y1, double x2, double y2)
 {
 	return sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1));
 }
+
 int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vector<double> &maps_y)
 {
 
@@ -215,7 +216,7 @@ public:
     }
 };
 
-int car_ahead(nlohmann::json &sensor_fusion, double lane, double car_x, double car_y, double car_yaw, double look_ahead, bool look_back) {
+int car_ahead(json &sensor_fusion, double lane, double car_x, double car_y, double car_yaw, double look_ahead, bool look_back) {
   double current_dist = 1e+10;
   int car_index = -1;
 
@@ -279,7 +280,8 @@ int main() {
 
   int target_lane = 1;
   double speed_limit = 49.9;
-  double inc_update = (speed_limit / 2.24) * 0.02 / 2;
+  /** maximum speed increase for one step */
+  double inc_update = (speed_limit / 2.24) * 0.02 / 1.5;
   double ref_speed = 0;
   double min_speed = inc_update;
 
@@ -323,10 +325,13 @@ int main() {
           // Sensor Fusion Data, a list of all other cars on the same side of the road.
           auto sensor_fusion = j[1]["sensor_fusion"];
 
+          /** Length of the previous path to reuse */
           double buf_size = previous_path_x.size() / 2;
 
+          /** Lane where the car is */
           int current_lane = ((int) car_d) / 4 ;
 
+          /** Deciding on reference points (where to continue previous path */
           int empty_limit = 2;
           vector<vector<double>> wpts;
           double ref_x = car_x, ref_y = car_y, ref_yaw = car_yaw;
@@ -348,51 +353,60 @@ int main() {
             wpts.push_back({ ref_x, ref_y });
           }
 
+          /** Distance to which car plans path on the lane */
           double look_ahead = 60;
 
+          /** Look for the car ahead in the same lane */
           int car_ahead_index = car_ahead(sensor_fusion, current_lane, car_x, car_y, car_yaw, look_ahead / 2, false);
           bool is_car_ahead = car_ahead_index > -1;
 
           if (is_car_ahead) {
+            /** Try to slow down to prevent collision */
             ref_speed -= inc_update;
 
             auto car_ahead_ = Car(sensor_fusion, car_ahead_index);
             double car_dist = car_ahead_.distanceTo(car_x, car_y);
-            // Speed update
+            /** Reset the speed of the lane to the value of the car ahead */
             min_speed = max(inc_update, car_ahead_.speed * 2.24 - (look_ahead / 2 - car_dist));
 
-            // Choose lane if not switching
+            /** If we are not switching, consider it, as we have vehicle up ahead */
             if (target_lane == current_lane) {
-              // TODO: Implement for current lane a well
               vector<vector<double>> lanes = { { (double) current_lane + 1, -1 }, { (double) current_lane - 1, -1 } };
 
               int next_lane = current_lane;
               for (auto &pair: lanes) {
-                int lane = (int) pair[0];
+                auto lane = (int) round(pair[0]);
                 if (lane < 0 || lane > 2) {
                   pair[1] = 1e10;
                   continue;
                 }
 
-                // TODO: Use both
+                /** Look for the cars on the target lane */
                 auto lane_car_index = car_ahead(sensor_fusion, lane, car_x, car_y, car_yaw, look_ahead, false);
                 auto lane_back_index = car_ahead(sensor_fusion, lane, car_x, car_y, car_yaw, look_ahead / 2, true);
 
-//                if (lane_car_index != lane_back_index) lane_car_index = lane_back_index;
+                /**
+                 * To switch, we consider that target lane:
+                 *  could be not empty (choose empty if there is one)
+                 *  the car on the target lane should be further that current target;
+                 *  the should not be any cars behind which could collide while switching
+                 *  between to lanes with matching conditions choose the one with higher speed
+                 */
 
                 if (lane_car_index != -1) {
                   auto lane_ahead_ = Car(sensor_fusion, lane_car_index);
                   auto lane_ahead_dist = lane_ahead_.distanceTo(car_x, car_y);
 
-                  if (lane_ahead_dist > car_dist && lane_ahead_.speed > car_speed) {
+                  cout <<"::(dist: " <<lane_ahead_dist <<" : " <<car_dist <<" speed: " <<lane_ahead_.speed <<" : " << car_ahead_.speed <<")::";
+                  if (lane_ahead_dist > car_dist && lane_ahead_.speed > car_ahead_.speed) {
 
                     // Consider change
                     pair[1] = 1000 / (lane_ahead_dist + lane_ahead_.speed);
-                    cout << "for lane: " << pair[0] << " car is ahead | ";
+                    cout << "on lane" << pair[0] << " car is ahead | ";
 
                   } else {
                     pair[1] = 1e10;
-                    cout << "for lane: " << pair[0] << " car ahead is too slow | ";
+                    cout << "on lane " << pair[0] << " car ahead is too slow or close | ";
                   }
                 }
 
@@ -400,10 +414,10 @@ int main() {
                   // There is car to the back, do not change there
                   auto lane_back_ = Car(sensor_fusion, lane_back_index);
                   pair[1] = 1e10;
-                  cout << "for lane: " << pair[0] << " car is behind | ";
+                  cout << "on lane " << pair[0] << " car is behind | ";
                 }
 
-                cout << "for lane: " << pair[0] << " weight is " << pair[1] << " | ";
+                cout << "on lane " << pair[0] << " weight is " << pair[1] << " | ";
               }
               cout <<endl;
 
@@ -414,23 +428,27 @@ int main() {
             }
 
           } else if (ref_speed < speed_limit) {
+            /** If the lane is empty, maximize speed */
             ref_speed += inc_update;
           }
 
           bool lane_change = target_lane != current_lane;
 
           if (lane_change) cout <<"switch from " <<current_lane <<" to " <<target_lane <<endl;
-//          cout <<"car index: " <<car_ahead_index <<" min_speed: " << min_speed <<endl;
 
+          /** Make sure the speed is within bounds */
           ref_speed = max(min_speed, min(ref_speed, speed_limit));
 
+          /** Calculate how many meters can be crossed in one step to maintain speed */
           double m_per_update = 0.02 * ref_speed / 2.24; // freq * speed_limit / mph to mps
 
+          /** Plot several points ahead the trajectory */
           double dist = lane_change ? 40 : 30;
           for (int i = 0; i < 2; ++i) {
             wpts.push_back(getXY(car_s + (i + 1) * dist, (2 + 4 * target_lane), map_waypoints_s, map_waypoints_x, map_waypoints_y));
           }
 
+          /** Fit cubic polynomial to the points for smoothness */
           Eigen::VectorXd x_coords(wpts.size());
           Eigen::VectorXd y_coords(wpts.size());
           // Transform to car coords
@@ -447,6 +465,7 @@ int main() {
           vector<double> next_x_vals;
           vector<double> next_y_vals;
 
+          /** Give the points to simulator: first the previous path, then along the polynomial */
           for (int i = 0; i < buf_size; ++i) {
             next_x_vals.push_back(previous_path_x[i]);
             next_y_vals.push_back(previous_path_y[i]);
@@ -469,25 +488,8 @@ int main() {
             next_y_vals.push_back(y_val);
           }
 
-//          Eigen::VectorXd x0(6);
-//          double cte = polyeval(coeffs[0], 0);
-//          x0 <<0, 0, 0, car_speed, polyeval(coeffs[0], 0), -atan(coeffs[1]);
-//          mpc.Solve(x0, coeffs, speed_limit / 2.24);
-//
-//          for (int i = 0; i < mpc.ptsx.size(); ++i) {
-//            double x = mpc.ptsx[i];
-//            double y = mpc.ptsy[i];
-//
-//            double x_val = (x * cos(ref_yaw) - y * sin(ref_yaw)) + ref_x;
-//            double y_val = (y * cos(ref_yaw) + x * sin(ref_yaw)) + ref_y;
-//
-//            next_x_vals.push_back(x_val);
-//            next_y_vals.push_back(y_val);
-//          }
-
           json msgJson;
 
-          // TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
 
